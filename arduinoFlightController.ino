@@ -14,10 +14,7 @@ double noseX, noseY, noseZ, rWingX, rWingY, rWingZ, ceilingX, ceilingY, ceilingZ
 unsigned long lastGyroReadTime, previousReadingTime;
 int loopsSinceLastSerialWrite;
 int loopsSinceLastOrthonormalization;
-
-// gyro units to deg/s, rad/s according to default full-scale config
-#define DEG_PER_SECOND_PER_GYRO_UNIT 131.072
-#define RAD_PER_SECOND_PER_GYRO_UNIT 7509.87241234
+double gyroUnitToRadPerSecond; // gyro units to rad/s according to full-scale config
 
 #define SCALAR_PROD(a1, a2, a3, b1, b2, b3) ((a1) * (b1) + (a2) * (b2) + (a3) * (b3))
 #define COMPUTE_SIN_COS(ANG, SINVAR, COSVAR) { SINVAR = sin(ANG); COSVAR = cos(ANG); }
@@ -82,7 +79,7 @@ void initializeMPU()
 {
   Wire.begin();
   // not calling Wirer.setClock() was causing the Wire.requestFrom(MPU_addr, 14, true) operation 
-  // to take ~1400us "some times", whereas with this setting it takes always ~450
+  // to take ~1400us "sometimes", whereas with this setting it takes always ~450us
   Wire.setClock(400000L); 
   Wire.beginTransmission(MPU_addr);
   Wire.write(0x6B);  // PWR_MGMT_1 register
@@ -92,6 +89,12 @@ void initializeMPU()
   Wire.beginTransmission(MPU_addr);
   Wire.write(0x1A);   // CONFIG register (1A hex)
   Wire.write(0x03);   // Set the register bits to 00000011 (Digital Low Pass Filter -> ~43Hz)
+  Wire.endTransmission(true);
+  // set the full scale range of the gyroscope to +/- 500 deg/s
+  Wire.beginTransmission(MPU_addr);
+  Wire.write(0x1B);   // GYRO_CONFIG register (1B hex)
+  Wire.write(B00001000);   // ---00--- (00 = 250 d/s, 01 = 500 d/s, 10 = 1000 d/s, 11 = 2000 d/s)
+  gyroUnitToRadPerSecond = 500 * M_PI / 180 / 32767;  // full-scale config (deg/s) * conversion from deg to rad / maximum int16 value
   Wire.endTransmission(true);
 }
 
@@ -148,9 +151,9 @@ void updateOrientationAccordingToGyroInfo()
 {
   int microsSinceLastRead = (int) (lastGyroReadTime - previousReadingTime);
   // TODO: for greater precision, consider averaging the current gyro values with those from the previous reading
-  double gyroDeltaPitch = gyroX / RAD_PER_SECOND_PER_GYRO_UNIT * microsSinceLastRead / 1000000;
-  double gyroDeltaRoll =  gyroY / RAD_PER_SECOND_PER_GYRO_UNIT * microsSinceLastRead / 1000000;
-  double gyroDeltaYaw = gyroZ / RAD_PER_SECOND_PER_GYRO_UNIT * microsSinceLastRead / 1000000;
+  double gyroDeltaPitch = gyroX * gyroUnitToRadPerSecond * microsSinceLastRead / 1000000;
+  double gyroDeltaRoll =  gyroY * gyroUnitToRadPerSecond * microsSinceLastRead / 1000000;
+  double gyroDeltaYaw = gyroZ * gyroUnitToRadPerSecond * microsSinceLastRead / 1000000;
 
   double sinGDP, cosGDP, sinGDR, cosGDR, sinGDY, cosGDY;
   COMPUTE_SIN_COS(gyroDeltaPitch, sinGDP, cosGDP);
@@ -220,9 +223,81 @@ void updateOrientationAccordingToGyroInfo()
   */    
 }
 
+// accelerometerCorrectionFactor goes from 0 (disregard accelerometer info) to 1 
+// (discard pitch/roll info coming from gyroscope, use accelerometer data only)
 void correctOrientationAccordingToAccelInfo(double accelerometerCorrectionFactor)
 {
-  // TODO
+  // Most of the time the aircraft is not going to be accelerating a lot in any
+  // direction. Under that assumption, [accX, accY, accZ] is a vector pointing
+  // approximatly "up" (away from the center of the Earth). This vector is in
+  // aircraft coordinates and its scale is not relevant for this method, since
+  // only its direction will be used.
+
+  // transform [accX, accY, accZ] from aircraft coordinates into word coordinates
+  // accelCeiling = where should be the ceiling vector pointing in world coordinates, 
+  // according to the accelerometer, and assuming that the aircraft is not accelerating
+  double  accelCeilingX = SCALAR_PROD(rWingX, noseX, ceilingX, accX, accY, accZ),
+          accelCeilingY = SCALAR_PROD(rWingY, noseY, ceilingY, accX, accY, accZ),
+          accelCeilingZ = SCALAR_PROD(rWingZ, noseZ, ceilingZ, accX, accY, accZ);
+  // normalize accelCeiling vector
+  double accelCeilingNorm = sqrt(SCALAR_PROD(accelCeilingX, accelCeilingY, accelCeilingZ, accelCeilingX, accelCeilingY, accelCeilingZ));
+  accelCeilingX /= accelCeilingNorm;
+  accelCeilingY /= accelCeilingNorm;
+  accelCeilingZ /= accelCeilingNorm;
+
+  // Now let's determine what's the smallest rotation (axis + angle) that needs 
+  // to be performed to transform [accelCeilingX, accelCeilingY, accelCeilingZ] into 
+  // [0, 0, 1].
+
+  // If accelCeiling is already too close to [0, 0, 1], finding the smallest rotation that
+  // turns one into the other will be pointless and very sensitive to numerical errors
+  if (accelCeilingZ > 0.999)
+    return;
+
+  // angle = acos(SCALAR_PROD(accelCeiling, [0, 0, 1])) / (length(accelCeiling) * length([0, 0, 1]))
+  //       = acos((0 + 0 + accelCeiling) / (1 * 1))
+  double angle = acos(accelCeilingZ);   
+  // In general, the rotation axis is defined as SOURCE x TARGET where "x" is
+  // the "cross product". Since TARGET is [0, 0, 1], the cross product is trivial:
+  double  rotationAxisX = accelCeilingY, 
+          rotationAxisY = -accelCeilingX,
+          rotationAxisZ = 0;
+  // normalize rotationAxis
+  double rotationAxisNorm = sqrt(SCALAR_PROD(rotationAxisX, rotationAxisY, rotationAxisZ, rotationAxisX, rotationAxisY, rotationAxisZ));
+  rotationAxisX /= rotationAxisNorm;
+  rotationAxisY /= rotationAxisNorm;
+  rotationAxisZ /= rotationAxisNorm;
+
+  angle *= accelerometerCorrectionFactor;
+  double sinAngle = sin(angle), cosAngle = cos(angle);
+
+  rotateVector(rWingX, rWingY, rWingZ,
+                rotationAxisX, rotationAxisY, rotationAxisZ,
+                sinAngle, cosAngle,
+                rWingX, rWingY, rWingZ);
+  rotateVector(noseX, noseY, noseZ,
+                rotationAxisX, rotationAxisY, rotationAxisZ,
+                sinAngle, cosAngle,
+                noseX, noseY, noseZ);
+  rotateVector(ceilingX, ceilingY, ceilingZ,
+                rotationAxisX, rotationAxisY, rotationAxisZ,
+                sinAngle, cosAngle,
+                ceilingX, ceilingY, ceilingZ);                
+}
+
+void rotateVector(double vectX, double vectY, double vectZ, 
+                  double axisX, double axisY, double axisZ,
+                  double sinAngle, double cosAngle,
+                  double &resultX, double &resultY, double &resultZ)
+{
+  double  crossProductX = axisY * vectZ - axisZ * vectY,
+          crossProductY = axisZ * vectX - axisX * vectZ,
+          crossProductZ = axisX * vectY - axisY * vectX;
+  double scalarProduct = SCALAR_PROD(axisX, axisY, axisZ, vectX, vectY, vectZ);
+
+  resultX = vectX * cosAngle + crossProductX * sinAngle + axisX * scalarProduct * (1 - cosAngle);
+  resultY = vectY * cosAngle + crossProductY * sinAngle + axisY * scalarProduct * (1 - cosAngle);
+  resultZ = vectZ * cosAngle + crossProductZ * sinAngle + axisZ * scalarProduct * (1 - cosAngle);
 }
 
 // We perform hundreds of corrections per second to the orientation matrix, each
