@@ -23,13 +23,31 @@ double gyroUnitToRadPerSecond; // gyro units to rad/s according to full-scale co
 //#define COMPUTE_SIN_COS(ANG, SINVAR, COSVAR) { SINVAR = sin(ANG); COSVAR = sqrt(1 - SINVAR * SINVAR);}
 //   if (ANG > M_PI / 2 || ANG < - M_PI / 2) COSVAR *= -1; 
 
+// Variables related with Remote Control input. Some of these variables must be declared
+// as volatile so that they can be safely accessed by both the Interrupt Service Routine
+// and the main loop.
+// - current state of pulse
+bool rcChannel1PulseOn, rcChannel2PulseOn, 
+              rcChannel3PulseOn, rcChannel4PulseOn, 
+              rcChannel5PulseOn, rcChannel6PulseOn;
+// - value of micros() when the last pulse started
+unsigned long rcChannel1PulseStart, rcChannel2PulseStart, 
+                        rcChannel3PulseStart, rcChannel4PulseStart, 
+                        rcChannel5PulseStart, rcChannel6PulseStart;
+// - duration of the last finished pulse (regardless of a possible ongoing pulse)
+volatile unsigned long rcChannel1PulseWidth, rcChannel2PulseWidth, 
+                        rcChannel3PulseWidth, rcChannel4PulseWidth, 
+                        rcChannel5PulseWidth, rcChannel6PulseWidth;
+
 void setup() {
   initializeMPU();
-  
   pinMode(13, OUTPUT);
   digitalWrite(13, LOW);  // turn off the LED during gyro calibration
   determineGyroDeviationPerAxis();
   digitalWrite(13, HIGH); // turn on the LED when calibration is over
+
+  pinMode(13, INPUT);   // pin 13 will be used to read RC receiver pulses via ISR
+  setupPinChangeInterrupts();
 
   Serial.begin(9600);
   lastGyroReadTime = micros();
@@ -70,8 +88,11 @@ void loop() {
   if (loopsSinceLastSerialWrite == loopsPerSerialWrite)
   {
     loopsSinceLastSerialWrite = 0;
-    Serial.print(noseX); Serial.print(" , "); Serial.print(noseY); Serial.print(" , "); Serial.println(noseZ);
-    //Serial.print(rWingX); Serial.print(" , "); Serial.print(rWingY); Serial.print(" , "); Serial.println(rWingZ);
+    Serial.print(noseX); Serial.print(", "); Serial.print(noseY); Serial.print(", "); Serial.println(noseZ);
+    //Serial.print(rWingX); Serial.print(", "); Serial.print(rWingY); Serial.print(", "); Serial.println(rWingZ);
+    Serial.print(rcChannel1PulseWidth); Serial.print(", "); Serial.print(rcChannel2PulseWidth); Serial.print(", ");
+    Serial.print(rcChannel3PulseWidth); Serial.print(", "); Serial.print(rcChannel4PulseWidth); Serial.print(", ");
+    Serial.print(rcChannel5PulseWidth); Serial.print(", "); Serial.println(rcChannel6PulseWidth);
   }
 }
 
@@ -300,12 +321,11 @@ void rotateVector(double vectX, double vectY, double vectZ,
   resultZ = vectZ * cosAngle + crossProductZ * sinAngle + axisZ * scalarProduct * (1 - cosAngle);
 }
 
-// We perform hundreds of corrections per second to the orientation matrix, each
-// correction involving multiple matrix multiplications. The theoretical result
+// We perform hundreds of orientation corrections per second to the orientation matrix,
+// each correction involving multiple matrix multiplications. The theoretical result
 // of all these operations is always an orthogonal matrix (its columns are
 // orthogonal unit vectors), but in practice, numerical errors make the matrix
-// progressively lose this condition, so we need to restablish it from time
-// to time.
+// progressively lose this condition, so we need to restablish it from time to time.
 void orthonormalizeOrientationMatrix()
 {
     // normalize col1
@@ -339,4 +359,100 @@ void orthonormalizeOrientationMatrix()
     ceilingX /= col3Length;
     ceilingY /= col3Length;
     ceilingZ /= col3Length;    
+}
+
+// Use pin change interrupts to keep track of RC receiver pulse widths "in parallel"
+// with the program main loop
+void setupPinChangeInterrupts()
+{
+  // initialize pulse states and widths
+  rcChannel1PulseOn = rcChannel2PulseOn = rcChannel3PulseOn = 
+    rcChannel4PulseOn = rcChannel5PulseOn = rcChannel6PulseOn = false;
+  rcChannel1PulseWidth = rcChannel2PulseWidth = rcChannel3PulseWidth = 
+    rcChannel4PulseWidth = rcChannel5PulseWidth = rcChannel6PulseWidth = 0;
+
+  // Use digital pins 8 - 13 to monitor RC receiver channels 1 - 6
+  // see http://playground.arduino.cc/Main/PinChangeInterrupt and https://www.arduino.cc/en/Reference/attachInterrupt
+  PCICR |= (1 << PCIE0);      // Set PCIE0 to enable PCMSK0 scan.
+  PCMSK0 |= B00111111;        // All 6 pins from D8 to D13 will trigger an interrupt on state change.
+}
+
+// Interrupt Service Routine monitoring when the pulses coming from the each RC receiver channel start 
+// and end to determine their widths.
+ISR(PCINT0_vect){
+  // Avoiding loops and arrays in order to make this function as fast as possible (as recommended for ISRs).
+  // Will consider loops and arrays (shorter / more readable) at some point and see if it actually makes a difference.
+  unsigned long currentTime = micros();
+  //== Channel1 =========================================
+  if(PINB & B00000001){                   //Is input 8 high?
+    if (!rcChannel1PulseOn){              //Pin changed from LOW to HIGH
+      rcChannel1PulseOn = true;                                                   
+      rcChannel1PulseStart = currentTime; //Take note of when the pulse started
+    }
+  }
+  else if (rcChannel1PulseOn)             // Pin changed from HIGH to LOW 
+  {
+    rcChannel1PulseOn = false;
+    rcChannel1PulseWidth = (currentTime - rcChannel1PulseStart);
+  }
+  //== Channel2 =========================================
+  if(PINB & B00000010){                   //Is input 9 high?
+    if (!rcChannel2PulseOn){              //Pin changed from LOW to HIGH
+      rcChannel2PulseOn = true;                                                   
+      rcChannel2PulseStart = currentTime; //Take note of when the pulse started
+    }
+  }
+  else if (rcChannel2PulseOn)             // Pin changed from HIGH to LOW 
+  {
+    rcChannel2PulseOn = false;
+    rcChannel2PulseWidth = (currentTime - rcChannel2PulseStart);
+  }
+  //== Channel3 =========================================
+  if(PINB & B00000100){                   //Is input 10 high?
+    if (!rcChannel3PulseOn){              //Pin changed from LOW to HIGH
+      rcChannel3PulseOn = true;                                                   
+      rcChannel3PulseStart = currentTime; //Take note of when the pulse started
+    }
+  }
+  else if (rcChannel3PulseOn)             // Pin changed from HIGH to LOW 
+  {
+    rcChannel3PulseOn = false;
+    rcChannel3PulseWidth = (currentTime - rcChannel3PulseStart);
+  }
+  //== Channel4 =========================================
+  if(PINB & B00001000){                   //Is input 11 high?
+    if (!rcChannel4PulseOn){              //Pin changed from LOW to HIGH
+      rcChannel4PulseOn = true;                                                   
+      rcChannel4PulseStart = currentTime; //Take note of when the pulse started
+    }
+  }
+  else if (rcChannel4PulseOn)             // Pin changed from HIGH to LOW 
+  {
+    rcChannel4PulseOn = false;
+    rcChannel4PulseWidth = (currentTime - rcChannel4PulseStart);
+  }
+  //== Channel5 =========================================
+  if(PINB & B00010000){                   //Is input 12 high?
+    if (!rcChannel5PulseOn){              //Pin changed from LOW to HIGH
+      rcChannel5PulseOn = true;                                                   
+      rcChannel5PulseStart = currentTime; //Take note of when the pulse started
+    }
+  }
+  else if (rcChannel5PulseOn)             // Pin changed from HIGH to LOW 
+  {
+    rcChannel5PulseOn = false;
+    rcChannel5PulseWidth = (currentTime - rcChannel5PulseStart);
+  }
+  //== Channel6 =========================================
+  if(PINB & B00100000){                   //Is input 13 high?
+    if (!rcChannel6PulseOn){              //Pin changed from LOW to HIGH
+      rcChannel6PulseOn = true;                                                   
+      rcChannel6PulseStart = currentTime; //Take note of when the pulse started
+    }
+  }
+  else if (rcChannel6PulseOn)             // Pin changed from HIGH to LOW 
+  {
+    rcChannel6PulseOn = false;
+    rcChannel6PulseWidth = (currentTime - rcChannel6PulseStart);
+  }
 }
