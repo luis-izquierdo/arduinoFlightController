@@ -1,11 +1,25 @@
 #include<Wire.h>
 
+#define ST_DISARMED         0
+#define ST_ARMED            1
+#define ST_ARMED_SIGNAL_LOST  2
+
+#define DISARM_AFTER_SIGNAL_LOST_FOR_MICROS 2000000
+// related with the position of the throttle/rudder RC stick that will be recognized as an ARM / DISARM request
+#define ARM_DISARM_THROTTLE_PULSE_WIDTH 1100
+#define ARM_RUDDER_PULSE_WIDTH 1900
+#define DISARM_RUDDER_PULSE_WIDTH 1100
+// for how long must the ARM / DISARM signals be uninterruptedly received before running the command
+#define ARM_SIGNAL_DURATION_MICROS 1000000
+#define DISARM_SIGNAL_DURATION_MICROS 1000000
+
 const int MPU_addr = 0x68;  // I2C address of the MPU-6050/MPU-6500
 const int loopsPerSerialWrite = 80;
 const int loopsPerOrthonormalization = 5 * 250; // orthonormalize orientation matrix every 5 seconds
 const int microsBetweenReads = 4000;
 const double accelerometerCorrectionFactor = 0.15;
 
+byte currentState;
 int16_t accX, accY, accZ, temperature, gyroX, gyroY, gyroZ;
 int gyroAvgDevX, gyroAvgDevY, gyroAvgDevZ;
 // components of the orientation matrix
@@ -33,7 +47,8 @@ bool rcChannel1PulseOn, rcChannel2PulseOn,
 // - value of micros() when the last pulse started
 unsigned long rcChannel1PulseStart, rcChannel2PulseStart, 
                         rcChannel3PulseStart, rcChannel4PulseStart, 
-                        rcChannel5PulseStart, rcChannel6PulseStart;
+                        rcChannel5PulseStart, rcChannel6PulseStart,
+                        armSignalStartTime, disarmSignalStartTime;
 // - duration of the last finished pulse (regardless of a possible ongoing pulse)
 volatile unsigned long rcChannel1PulseWidth, rcChannel2PulseWidth, 
                         rcChannel3PulseWidth, rcChannel4PulseWidth, 
@@ -64,6 +79,8 @@ void setup() {
   ceilingX = 0;
   ceilingY = 0;
   ceilingZ = 1;
+
+  currentState = ST_DISARMED;
 }
 
 void loop() {
@@ -83,7 +100,8 @@ void loop() {
     loopsSinceLastOrthonormalization = 0;
     orthonormalizeOrientationMatrix();    
   }
-  
+
+  // FOR DEVELOPMENT / DEBUGGING PHASE ONLY
   loopsSinceLastSerialWrite++;
   if (loopsSinceLastSerialWrite == loopsPerSerialWrite)
   {
@@ -93,6 +111,47 @@ void loop() {
     Serial.print(rcChannel1PulseWidth); Serial.print(", "); Serial.print(rcChannel2PulseWidth); Serial.print(", ");
     Serial.print(rcChannel3PulseWidth); Serial.print(", "); Serial.print(rcChannel4PulseWidth); Serial.print(", ");
     Serial.print(rcChannel5PulseWidth); Serial.print(", "); Serial.println(rcChannel6PulseWidth);
+  }
+
+  if (currentState != ST_DISARMED)
+    disarmOrArmOnSignalLost();  // detect whether RC signal has been lost or recovered and go to either ST_ARMED or ST_ARMED_SIGNAL_LOST
+
+  // update armSignalStartTime and or disarmSignalStartTime if the ARM / DISARM commands just started being received
+  // assuming channel 1 = throttle, channel 4 = rudder
+  unsigned long currentTime = micros();  
+  if (rcChannel1PulseWidth <= ARM_DISARM_THROTTLE_PULSE_WIDTH)
+  {
+    if (rcChannel4PulseWidth <= DISARM_RUDDER_PULSE_WIDTH)
+    {
+      if (disarmSignalStartTime >= currentTime) // if the DISARM command was not being received until now
+        disarmSignalStartTime = currentTime;
+    }
+    else if (rcChannel4PulseWidth >= ARM_RUDDER_PULSE_WIDTH)
+    {
+      if (armSignalStartTime >= currentTime)    // if the ARM command was not being received until now
+        armSignalStartTime = currentTime;    
+    }
+    else
+        armSignalStartTime = disarmSignalStartTime = currentTime + 100000;  // reset command start times: add an amount of microseconds greater than our loop function period
+  }
+  else
+    armSignalStartTime = disarmSignalStartTime = currentTime + 100000;  //  reset command start times: add an amount of microseconds greater than our loop function period  
+  
+  switch(currentState){
+    case ST_DISARMED:
+      //detect if RC "ARM" signal has been sent for long enough
+      if (currentTime - armSignalStartTime > ARM_SIGNAL_DURATION_MICROS) // if the arm signal is not being received at this time, armSignalStartTime will be set to a value in the future
+        currentState = ST_ARMED;
+      break;
+    case ST_ARMED:
+      //detect if RC "DISARM" signal has been sent for long enough
+      if (currentTime - disarmSignalStartTime > DISARM_SIGNAL_DURATION_MICROS)
+      {
+        currentState = ST_DISARMED;
+        break;
+      }
+      computeMotorsPowerForSelfLeveling();
+      break;
   }
 }
 
@@ -250,7 +309,7 @@ void correctOrientationAccordingToAccelInfo(double accelerometerCorrectionFactor
 {
   // Most of the time the aircraft is not going to be accelerating a lot in any
   // direction. Under that assumption, [accX, accY, accZ] is a vector pointing
-  // approximatly "up" (away from the center of the Earth). This vector is in
+  // approximately "up" (away from the center of the Earth). This vector is in
   // aircraft coordinates and its scale is not relevant for this method, since
   // only its direction will be used.
 
@@ -361,6 +420,43 @@ void orthonormalizeOrientationMatrix()
     ceilingZ /= col3Length;    
 }
 
+void disarmOrArmOnSignalLost()
+{
+  unsigned long currentTime = micros();
+  // TODO: consider edge cases, like when the micros() value is very small because the arduino was just
+  // turned on, or when the very first pulse from the RC hasn't been received yet
+  unsigned long threshold = currentTime - DISARM_AFTER_SIGNAL_LOST_FOR_MICROS;
+  bool signalLost = rcChannel1PulseStart - threshold ||
+    rcChannel2PulseStart - threshold ||
+    rcChannel3PulseStart - threshold ||
+    rcChannel4PulseStart - threshold ||
+    rcChannel5PulseStart - threshold ||
+    rcChannel6PulseStart - threshold;
+  
+  if (signalLost)
+  {
+    if (currentState == ST_ARMED)
+    {
+      currentState = ST_ARMED_SIGNAL_LOST;
+    }
+    // if the signal while the ARM or DISARM commands are being sent, reset these commands' start time (set them to a value in the future) 
+    armSignalStartTime = disarmSignalStartTime = currentTime + 100000;  // add an amount of microseconds greater than our loop function period 
+  }
+  else if (currentState == ST_ARMED_SIGNAL_LOST)
+  {
+    currentState = ST_ARMED;
+  }
+}
+
+void computeMotorsPowerForSelfLeveling()
+{
+  // set each motor's current power based on
+  // 1-) the current throttle level according to the RC signal
+  // 2-) the desired orientation according to the RC signal
+  // 3-) the current orientation and angle velocities according to the gyroscope and accelerometer (orientation matrix)
+  // TODO
+}
+
 // Use pin change interrupts to keep track of RC receiver pulse widths "in parallel"
 // with the program main loop
 void setupPinChangeInterrupts()
@@ -370,6 +466,7 @@ void setupPinChangeInterrupts()
     rcChannel4PulseOn = rcChannel5PulseOn = rcChannel6PulseOn = false;
   rcChannel1PulseWidth = rcChannel2PulseWidth = rcChannel3PulseWidth = 
     rcChannel4PulseWidth = rcChannel5PulseWidth = rcChannel6PulseWidth = 0;
+  armSignalStartTime = disarmSignalStartTime = micros() + 10000;
 
   // Use digital pins 8 - 13 to monitor RC receiver channels 1 - 6
   // see http://playground.arduino.cc/Main/PinChangeInterrupt and https://www.arduino.cc/en/Reference/attachInterrupt
